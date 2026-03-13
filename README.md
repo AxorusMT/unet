@@ -1,6 +1,5 @@
-# unetcode
-
-`unetcode` is a modern C++23 UDP game networking library inspired by ENet.
+# unet
+`unet` is a modern C++23 UDP game networking library inspired by ENet.
 
 It provides:
 
