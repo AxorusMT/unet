@@ -127,6 +127,6 @@ Client APIs:
 
 ## Examples
 
-- `unetcode_chat_server`
-- `unetcode_chat_client`
-- `unetcode_p2p_file_node`
+- `unet_chat_server`
+- `unet_chat_client`
+- `unet_p2p_file_node`
