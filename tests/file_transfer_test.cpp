@@ -42,7 +42,7 @@ std::vector<std::byte> read_all_bytes(const std::filesystem::path& path) {
 int main() {
     namespace fs = std::filesystem;
 
-    const fs::path base = fs::temp_directory_path() / "unetcode_file_transfer_test";
+    const fs::path base = fs::temp_directory_path() / "unet_file_transfer_test";
     const fs::path source = base / "source.bin";
     const fs::path downloads = base / "downloads";
     std::error_code ec{};

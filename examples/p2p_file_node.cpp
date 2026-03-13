@@ -10,8 +10,8 @@
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage:\n"
-                  << "  unetcode_p2p_file_node <listen_port>\n"
-                  << "  unetcode_p2p_file_node <listen_port> <connect_host> <connect_port> [send_file_path]\n";
+                  << "  unet_p2p_file_node <listen_port>\n"
+                  << "  unet_p2p_file_node <listen_port> <connect_host> <connect_port> [send_file_path]\n";
         return 1;
     }
 

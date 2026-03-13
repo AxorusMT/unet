@@ -12,7 +12,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "Usage: unetcode_chat_client <host> <port>\n";
+        std::cerr << "Usage: unet_chat_client <host> <port>\n";
         return 1;
     }
 
