@@ -1,11 +1,11 @@
 # unet
-`unet` is a modern C++23 UDP game networking library inspired by ENet.
+`unet` is a modern C++23 game networking library inspired by ENet, with UDP and TCP transport support.
 
 It provides:
 
-- Connection-oriented UDP host/peer model
+- Connection-oriented host/peer model over UDP or TCP
 - P2P node mode (listen + dial on the same host)
-- Reliable ordered delivery over UDP with retransmission
+- Reliable ordered delivery with retransmission/ordering
 - Unreliable and unreliable-sequenced delivery modes
 - Channel-based streams
 - Automatic MTU-aware fragmentation + reassembly
@@ -19,6 +19,7 @@ It provides:
   - Server comments with threaded replies + likes
   - Matchmaking from player profile data (region/playlist/mmr/party size)
   - NAT traversal coordination (UDP hole-punch rendezvous)
+- Optional UPnP IGD port mapping for incoming UDP/TCP endpoints
 - Native platform sockets (WinSock2 / POSIX sockets), no external deps
 
 ## Build
@@ -26,7 +27,7 @@ It provides:
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -C Debug --output-on-failure
 ```
 
 ## Quick start
@@ -60,6 +61,18 @@ for (;;) {
 - `Delivery::Unreliable`
 - `Delivery::UnreliableSequenced`
 
+## Transport selection
+
+```cpp
+unet::HostConfig cfg{};
+cfg.transport = unet::Transport::Tcp; // default is Transport::Udp
+
+unet::Host server(cfg);
+server.start_server(7777, "0.0.0.0");
+```
+
+`DirectoryServer` / `DirectoryClient` use `DirectoryConfig::host.transport`.
+
 ## P2P + files
 
 ```cpp
@@ -88,6 +101,36 @@ File transfer events:
 - `Event::Type::FileRejected`
 
 `file_transfer_channel` is reserved for the built-in file protocol; avoid using it for normal game payloads.
+
+## UPnP Port Mapping
+
+```cpp
+unet::HostConfig cfg{};
+cfg.enable_upnp = true;
+cfg.require_upnp = false; // start still succeeds if mapping fails
+cfg.upnp_description = "my-unet-server";
+
+unet::Host server(cfg);
+server.start_server(7777, "0.0.0.0");
+
+if (auto public_ep = server.upnp_external_address()) {
+    // Router mapping succeeded
+    std::cout << public_ep->to_string() << "\n";
+} else if (auto upnp_error = server.upnp_last_error()) {
+    // Mapping was attempted but failed
+    std::cout << upnp_error->message << "\n";
+}
+```
+
+UPnP fields in `HostConfig`:
+
+- `enable_upnp`
+- `require_upnp`
+- `upnp_external_port` (`0` = same as listen port)
+- `upnp_discovery_timeout`
+- `upnp_lease_duration`
+- `upnp_description`
+- `upnp_discovery_address` / `upnp_discovery_port` (useful for testing)
 
 ## Directory Services (Browser, Comments, Matchmaking, NAT)
 
@@ -130,3 +173,6 @@ Client APIs:
 - `unet_chat_server`
 - `unet_chat_client`
 - `unet_p2p_file_node`
+- `unet_tcp_chat_server`
+- `unet_tcp_chat_client`
+- `unet_upnp_server`

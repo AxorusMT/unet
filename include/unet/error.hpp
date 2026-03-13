@@ -24,7 +24,10 @@ enum class ErrorCode {
     FileReadFailed,
     FileWriteFailed,
     FileTransferNotFound,
-    FileTransferStateInvalid
+    FileTransferStateInvalid,
+    UpnpDiscoveryFailed,
+    UpnpDescriptionFailed,
+    UpnpControlFailed
 };
 
 struct Error {

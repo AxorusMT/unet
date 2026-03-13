@@ -12,6 +12,7 @@ add_library(unet STATIC
     src/services.cpp
     src/detail/platform.cpp
     src/detail/socket.cpp
+    src/detail/upnp.cpp
 )
 
 target_include_directories(unet
@@ -60,6 +61,15 @@ if(UNET_BUILD_EXAMPLES)
 
     add_executable(unet_p2p_file_node examples/p2p_file_node.cpp)
     target_link_libraries(unet_p2p_file_node PRIVATE unet)
+
+    add_executable(unet_tcp_chat_server examples/tcp_chat_server.cpp)
+    target_link_libraries(unet_tcp_chat_server PRIVATE unet)
+
+    add_executable(unet_tcp_chat_client examples/tcp_chat_client.cpp)
+    target_link_libraries(unet_tcp_chat_client PRIVATE unet)
+
+    add_executable(unet_upnp_server examples/upnp_server.cpp)
+    target_link_libraries(unet_upnp_server PRIVATE unet)
 endif()
 
 if(UNET_BUILD_TESTS)
@@ -85,6 +95,22 @@ if(UNET_BUILD_TESTS)
     add_test(NAME unet_services_test COMMAND unet_services_test)
     if(UNET_ENABLE_SANITIZERS AND MSVC)
         set_tests_properties(unet_services_test PROPERTIES
+            ENVIRONMENT "PATH=${UNET_MSVC_ASAN_RUNTIME_DIR};$ENV{PATH}")
+    endif()
+
+    add_executable(unet_tcp_test tests/tcp_test.cpp)
+    target_link_libraries(unet_tcp_test PRIVATE unet)
+    add_test(NAME unet_tcp_test COMMAND unet_tcp_test)
+    if(UNET_ENABLE_SANITIZERS AND MSVC)
+        set_tests_properties(unet_tcp_test PROPERTIES
+            ENVIRONMENT "PATH=${UNET_MSVC_ASAN_RUNTIME_DIR};$ENV{PATH}")
+    endif()
+
+    add_executable(unet_upnp_test tests/upnp_test.cpp)
+    target_link_libraries(unet_upnp_test PRIVATE unet)
+    add_test(NAME unet_upnp_test COMMAND unet_upnp_test)
+    if(UNET_ENABLE_SANITIZERS AND MSVC)
+        set_tests_properties(unet_upnp_test PROPERTIES
             ENVIRONMENT "PATH=${UNET_MSVC_ASAN_RUNTIME_DIR};$ENV{PATH}")
     endif()
 endif()

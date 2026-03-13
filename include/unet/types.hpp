@@ -9,6 +9,11 @@ namespace unet {
 using PeerId = std::uint16_t;
 inline constexpr PeerId invalid_peer_id = 0;
 
+enum class Transport : std::uint8_t {
+    Udp = 0,
+    Tcp = 1
+};
+
 enum class Delivery : std::uint8_t {
     Unreliable = 0,
     UnreliableSequenced = 1,
@@ -38,4 +43,3 @@ struct PeerStats {
 };
 
 }  // namespace unet
-

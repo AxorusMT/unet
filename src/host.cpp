@@ -1,7 +1,9 @@
 #include "unet/host.hpp"
 
+#include "detail/address_native.hpp"
 #include "detail/platform.hpp"
 #include "detail/socket.hpp"
+#include "detail/upnp.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -300,6 +303,195 @@ std::filesystem::path sanitize_filename(std::string_view name) {
     return std::filesystem::path(filename);
 }
 
+constexpr std::size_t kTcpFrameHeaderSize = 2;
+
+bool is_would_block_error(int err) {
+#if defined(_WIN32)
+    return err == WSAEWOULDBLOCK;
+#else
+    return err == EWOULDBLOCK || err == EAGAIN;
+#endif
+}
+
+bool is_connect_in_progress_error(int err) {
+#if defined(_WIN32)
+    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEALREADY;
+#else
+    return err == EINPROGRESS || err == EALREADY || err == EWOULDBLOCK || err == EAGAIN;
+#endif
+}
+
+std::expected<detail::SocketHandle, Error> open_tcp_socket(std::string_view bind_ip, std::uint16_t port, bool enable_ipv6) {
+    const auto resolved = Address::resolve(bind_ip, port, enable_ipv6);
+    if (!resolved.has_value()) {
+        return std::unexpected(resolved.error());
+    }
+
+    const Address bind_address = *resolved;
+    const sockaddr* native = detail::NativeAddressAccess::sockaddr_ref(bind_address);
+    const int family = native->sa_family;
+
+    detail::SocketHandle handle = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (handle == detail::kInvalidSocket) {
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketOpenFailed,
+            .message = detail::socket_error_message(detail::last_socket_error())
+        });
+    }
+
+    const int one = 1;
+    (void)setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), static_cast<detail::SockLen>(sizeof(one)));
+
+    if (const auto non_blocking = detail::set_non_blocking(handle); !non_blocking.has_value()) {
+        const Error error = non_blocking.error();
+        detail::close_socket(handle);
+        return std::unexpected(error);
+    }
+
+#if defined(IPPROTO_IPV6) && defined(IPV6_V6ONLY)
+    if (family == AF_INET6) {
+        const int dual_stack = 0;
+        (void)setsockopt(handle, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&dual_stack), static_cast<detail::SockLen>(sizeof(dual_stack)));
+    }
+#endif
+
+    if (::bind(handle, native, detail::NativeAddressAccess::length(bind_address)) != 0) {
+        const Error error{
+            .code = ErrorCode::SocketBindFailed,
+            .message = detail::socket_error_message(detail::last_socket_error())
+        };
+        detail::close_socket(handle);
+        return std::unexpected(error);
+    }
+
+    return handle;
+}
+
+std::expected<std::optional<std::pair<detail::SocketHandle, Address>>, Error> tcp_accept(
+    detail::SocketHandle listen_socket) {
+    Address address{};
+    detail::SockLen len = detail::NativeAddressAccess::capacity();
+    detail::SocketHandle client = ::accept(
+        listen_socket,
+        detail::NativeAddressAccess::sockaddr_mut(address),
+        &len);
+    if (client == detail::kInvalidSocket) {
+        const int err = detail::last_socket_error();
+        if (is_would_block_error(err)) {
+            return std::optional<std::pair<detail::SocketHandle, Address>>{};
+        }
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketReceiveFailed,
+            .message = detail::socket_error_message(err)
+        });
+    }
+
+    if (const auto non_blocking = detail::set_non_blocking(client); !non_blocking.has_value()) {
+        const Error error = non_blocking.error();
+        detail::close_socket(client);
+        return std::unexpected(error);
+    }
+
+    detail::NativeAddressAccess::set_length(address, len);
+    return std::optional<std::pair<detail::SocketHandle, Address>>(std::pair<detail::SocketHandle, Address>{client, address});
+}
+
+std::expected<std::optional<std::size_t>, Error> tcp_receive_some(
+    detail::SocketHandle socket,
+    std::span<std::byte> buffer) {
+    const int received = ::recv(
+        socket,
+        reinterpret_cast<char*>(buffer.data()),
+        static_cast<int>(buffer.size()),
+        0);
+    if (received > 0) {
+        return std::optional<std::size_t>(static_cast<std::size_t>(received));
+    }
+    if (received == 0) {
+        return std::optional<std::size_t>(0);
+    }
+
+    const int err = detail::last_socket_error();
+    if (is_would_block_error(err)) {
+        return std::optional<std::size_t>{};
+    }
+    return std::unexpected(Error{
+        .code = ErrorCode::SocketReceiveFailed,
+        .message = detail::socket_error_message(err)
+    });
+}
+
+std::expected<std::optional<std::size_t>, Error> tcp_send_some(
+    detail::SocketHandle socket,
+    std::span<const std::byte> buffer) {
+    const int sent = ::send(
+        socket,
+        reinterpret_cast<const char*>(buffer.data()),
+        static_cast<int>(buffer.size()),
+        0);
+    if (sent > 0) {
+        return std::optional<std::size_t>(static_cast<std::size_t>(sent));
+    }
+    if (sent == 0) {
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketSendFailed,
+            .message = "TCP connection closed"
+        });
+    }
+
+    const int err = detail::last_socket_error();
+    if (is_would_block_error(err)) {
+        return std::optional<std::size_t>{};
+    }
+    return std::unexpected(Error{
+        .code = ErrorCode::SocketSendFailed,
+        .message = detail::socket_error_message(err)
+    });
+}
+
+std::expected<bool, Error> tcp_connect_finished(detail::SocketHandle socket) {
+    fd_set writes{};
+    fd_set errors{};
+    FD_ZERO(&writes);
+    FD_ZERO(&errors);
+    FD_SET(socket, &writes);
+    FD_SET(socket, &errors);
+    timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    const int selected = ::select(
+        static_cast<int>(socket + 1),
+        nullptr,
+        &writes,
+        &errors,
+        &timeout);
+    if (selected < 0) {
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketOpenFailed,
+            .message = detail::socket_error_message(detail::last_socket_error())
+        });
+    }
+    if (selected == 0) {
+        return false;
+    }
+
+    int so_error = 0;
+    detail::SockLen so_len = static_cast<detail::SockLen>(sizeof(so_error));
+    if (::getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &so_len) != 0) {
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketOpenFailed,
+            .message = detail::socket_error_message(detail::last_socket_error())
+        });
+    }
+    if (so_error != 0) {
+        return std::unexpected(Error{
+            .code = ErrorCode::SocketOpenFailed,
+            .message = detail::socket_error_message(so_error)
+        });
+    }
+    return true;
+}
+
 }  // namespace
 
 class Host::Impl {
@@ -309,6 +501,17 @@ public:
           peers_(static_cast<std::size_t>(config_.max_peers) + 1) {}
 
     ~Impl() {
+        clear_upnp_mapping();
+        for (auto& peer : peers_) {
+            if (peer.has_value() && peer->tcp_socket != detail::kInvalidSocket) {
+                detail::close_socket(peer->tcp_socket);
+                peer->tcp_socket = detail::kInvalidSocket;
+            }
+        }
+        if (tcp_listen_socket_ != detail::kInvalidSocket) {
+            detail::close_socket(tcp_listen_socket_);
+            tcp_listen_socket_ = detail::kInvalidSocket;
+        }
         socket_.close();
         if (socket_runtime_ready_) {
             detail::shutdown_sockets();
@@ -389,6 +592,11 @@ public:
         std::deque<std::uint32_t> sent_packet_order{};
         std::unordered_map<std::uint64_t, ReliableMessage> reliable_outgoing{};
         std::unordered_map<std::uint64_t, Assembly> assemblies{};
+        detail::SocketHandle tcp_socket{detail::kInvalidSocket};
+        bool tcp_connect_in_progress{false};
+        std::vector<std::byte> tcp_recv_buffer{};
+        std::vector<std::byte> tcp_send_buffer{};
+        std::size_t tcp_send_offset{};
         PeerStats stats{};
     };
 
@@ -454,8 +662,14 @@ public:
     [[nodiscard]] std::vector<PeerId> connected_peers() const;
     [[nodiscard]] std::optional<Address> peer_address(PeerId id) const;
     [[nodiscard]] std::optional<PeerStats> peer_stats(PeerId id) const;
+    [[nodiscard]] std::optional<Address> upnp_external_address() const;
+    [[nodiscard]] std::optional<Error> upnp_last_error() const;
 
 private:
+    [[nodiscard]] bool using_tcp() const noexcept {
+        return config_.transport == Transport::Tcp;
+    }
+
     [[nodiscard]] PeerId allocate_peer_id() const;
     [[nodiscard]] Peer* peer_by_id(PeerId id);
     [[nodiscard]] const Peer* peer_by_id(PeerId id) const;
@@ -487,6 +701,10 @@ private:
         std::optional<ReliableRef> reliable_ref);
 
     void receive_loop();
+    void receive_loop_udp();
+    void receive_loop_tcp();
+    void accept_tcp_peers();
+    [[nodiscard]] std::expected<void, Error> flush_tcp_send(Peer& peer);
     void process_datagram(const Address& from, std::span<const std::byte> bytes);
     void handle_connect_request(const Address& from);
     void handle_connect_accept(Peer& peer, const WireHeader& header);
@@ -511,6 +729,8 @@ private:
     void emit_file_progress(PeerId peer, std::uint64_t transfer_id, std::uint64_t transferred, std::uint64_t total, bool upload);
     void emit_file_complete(PeerId peer, std::uint64_t transfer_id, std::string filename, std::uint64_t total_bytes, std::string path, bool upload);
     void emit_file_rejected(PeerId peer, std::uint64_t transfer_id, std::string reason);
+    [[nodiscard]] std::expected<void, Error> setup_upnp_mapping(std::uint16_t listen_port, std::string_view bind_ip);
+    void clear_upnp_mapping() noexcept;
 
     HostConfig config_{};
     bool running_{false};
@@ -518,11 +738,14 @@ private:
     bool accepts_incoming_{false};
     Mode mode_{Mode::Stopped};
     detail::UdpSocket socket_{};
+    detail::SocketHandle tcp_listen_socket_{detail::kInvalidSocket};
     std::vector<std::optional<Peer>> peers_{};
     std::deque<Event> events_{};
     std::unordered_map<std::uint64_t, UploadTransfer> uploads_{};
     std::unordered_map<TransferKey, DownloadTransfer, TransferKeyHash> downloads_{};
     std::uint64_t next_transfer_id_{1};
+    std::optional<detail::UpnpMapping> upnp_mapping_{};
+    std::optional<Error> upnp_last_error_{};
 };
 
 std::expected<void, Error> Host::Impl::ensure_socket_runtime() {
@@ -539,6 +762,12 @@ std::expected<void, Error> Host::Impl::ensure_socket_runtime() {
 }
 
 std::expected<void, Error> Host::Impl::validate_config() const {
+    if (config_.transport != Transport::Udp && config_.transport != Transport::Tcp) {
+        return std::unexpected(Error{
+            .code = ErrorCode::InvalidState,
+            .message = "HostConfig.transport must be UDP or TCP"
+        });
+    }
     if (config_.max_peers == 0) {
         return std::unexpected(Error{
             .code = ErrorCode::InvalidState,
@@ -595,22 +824,117 @@ std::expected<void, Error> Host::Impl::validate_config() const {
             .message = "HostConfig.file_chunk_size must be in range [1, 65535]"
         });
     }
+    if (config_.enable_upnp) {
+        if (config_.upnp_discovery_timeout <= std::chrono::milliseconds::zero()) {
+            return std::unexpected(Error{
+                .code = ErrorCode::InvalidState,
+                .message = "HostConfig.upnp_discovery_timeout must be > 0"
+            });
+        }
+        if (config_.upnp_discovery_address.empty()) {
+            return std::unexpected(Error{
+                .code = ErrorCode::InvalidState,
+                .message = "HostConfig.upnp_discovery_address must not be empty"
+            });
+        }
+    }
     return {};
 }
 
 std::expected<void, Error> Host::Impl::open_listen_socket(std::uint16_t port, std::string_view bind_ip) {
     const bool explicit_ipv6 = bind_ip.find(':') != std::string_view::npos;
     const bool prefer_ipv6 = explicit_ipv6 || bind_ip == "::" || (bind_ip.empty() && config_.enable_ipv6);
-    if (const auto opened = socket_.open(bind_ip, port, prefer_ipv6); !opened.has_value()) {
+    if (!using_tcp()) {
+        if (const auto opened = socket_.open(bind_ip, port, prefer_ipv6); !opened.has_value()) {
+            const bool can_fallback_to_ipv4 = (bind_ip == "::" || bind_ip.empty()) && prefer_ipv6;
+            if (!can_fallback_to_ipv4) {
+                return std::unexpected(opened.error());
+            }
+            if (const auto fallback = socket_.open("0.0.0.0", port, false); !fallback.has_value()) {
+                return std::unexpected(fallback.error());
+            }
+        }
+        return {};
+    }
+
+    auto open_tcp = [&](std::string_view candidate_bind, bool candidate_ipv6) -> std::expected<detail::SocketHandle, Error> {
+        auto opened = open_tcp_socket(candidate_bind, port, candidate_ipv6);
+        if (!opened.has_value()) {
+            return std::unexpected(opened.error());
+        }
+        if (::listen(*opened, SOMAXCONN) != 0) {
+            const Error error{
+                .code = ErrorCode::SocketBindFailed,
+                .message = detail::socket_error_message(detail::last_socket_error())
+            };
+            detail::close_socket(*opened);
+            return std::unexpected(error);
+        }
+        return *opened;
+    };
+
+    auto opened = open_tcp(bind_ip, prefer_ipv6);
+    if (!opened.has_value()) {
         const bool can_fallback_to_ipv4 = (bind_ip == "::" || bind_ip.empty()) && prefer_ipv6;
         if (!can_fallback_to_ipv4) {
             return std::unexpected(opened.error());
         }
-        if (const auto fallback = socket_.open("0.0.0.0", port, false); !fallback.has_value()) {
-            return std::unexpected(fallback.error());
+        opened = open_tcp("0.0.0.0", false);
+        if (!opened.has_value()) {
+            return std::unexpected(opened.error());
         }
     }
+
+    if (tcp_listen_socket_ != detail::kInvalidSocket) {
+        detail::close_socket(tcp_listen_socket_);
+        tcp_listen_socket_ = detail::kInvalidSocket;
+    }
+    tcp_listen_socket_ = *opened;
     return {};
+}
+
+std::expected<void, Error> Host::Impl::setup_upnp_mapping(std::uint16_t listen_port, std::string_view bind_ip) {
+    if (!config_.enable_upnp) {
+        return {};
+    }
+    if (listen_port == 0) {
+        return std::unexpected(Error{
+            .code = ErrorCode::UpnpControlFailed,
+            .message = "UPnP requires a non-zero listen port"
+        });
+    }
+
+    detail::UpnpRequest request{};
+    request.internal_port = listen_port;
+    request.external_port = config_.upnp_external_port;
+    request.protocol = using_tcp() ? "TCP" : "UDP";
+    request.description = config_.upnp_description;
+    request.lease_duration = config_.upnp_lease_duration;
+    request.discovery_address = config_.upnp_discovery_address;
+    request.discovery_port = config_.upnp_discovery_port;
+    request.discovery_timeout = config_.upnp_discovery_timeout;
+
+    if (!bind_ip.empty() &&
+        bind_ip != "0.0.0.0" &&
+        bind_ip != "::" &&
+        bind_ip.find(':') == std::string_view::npos) {
+        request.internal_client = std::string(bind_ip);
+    }
+
+    auto mapped = detail::upnp_add_port_mapping(request);
+    if (!mapped.has_value()) {
+        return std::unexpected(mapped.error());
+    }
+
+    upnp_mapping_ = *mapped;
+    return {};
+}
+
+void Host::Impl::clear_upnp_mapping() noexcept {
+    if (upnp_mapping_.has_value()) {
+        (void)detail::upnp_remove_port_mapping(*upnp_mapping_, config_.upnp_discovery_timeout);
+        upnp_mapping_.reset();
+    }
 }
 
 void Host::Impl::push_event(Event event) {
@@ -635,6 +959,26 @@ std::expected<void, Error> Host::Impl::start_server(std::uint16_t port, std::str
         return std::unexpected(opened.error());
     }
 
+    clear_upnp_mapping();
+    upnp_last_error_.reset();
+    if (config_.enable_upnp) {
+        auto upnp = setup_upnp_mapping(port, bind_ip);
+        if (!upnp.has_value()) {
+            upnp_last_error_ = upnp.error();
+            if (config_.require_upnp) {
+                if (using_tcp()) {
+                    if (tcp_listen_socket_ != detail::kInvalidSocket) {
+                        detail::close_socket(tcp_listen_socket_);
+                        tcp_listen_socket_ = detail::kInvalidSocket;
+                    }
+                } else {
+                    socket_.close();
+                }
+                return std::unexpected(upnp.error());
+            }
+        }
+    }
+
     running_ = true;
     accepts_incoming_ = true;
     mode_ = Mode::Server;
@@ -656,6 +1000,26 @@ std::expected<void, Error> Host::Impl::start_p2p(std::uint16_t port, std::string
         return std::unexpected(opened.error());
     }
 
+    clear_upnp_mapping();
+    upnp_last_error_.reset();
+    if (config_.enable_upnp) {
+        auto upnp = setup_upnp_mapping(port, bind_ip);
+        if (!upnp.has_value()) {
+            upnp_last_error_ = upnp.error();
+            if (config_.require_upnp) {
+                if (using_tcp()) {
+                    if (tcp_listen_socket_ != detail::kInvalidSocket) {
+                        detail::close_socket(tcp_listen_socket_);
+                        tcp_listen_socket_ = detail::kInvalidSocket;
+                    }
+                } else {
+                    socket_.close();
+                }
+                return std::unexpected(upnp.error());
+            }
+        }
+    }
+
     running_ = true;
     accepts_incoming_ = true;
     mode_ = Mode::Peer;
@@ -675,13 +1039,15 @@ std::expected<PeerId, Error> Host::Impl::connect(const Address& remote) {
     }
 
     if (!running_) {
-        const bool remote_is_ipv6 = remote.ip().find(':') != std::string::npos;
         if (const auto runtime = ensure_socket_runtime(); !runtime.has_value()) {
             return std::unexpected(runtime.error());
         }
-        const std::string_view bind_ip = remote_is_ipv6 ? "::" : "0.0.0.0";
-        if (const auto opened = socket_.open(bind_ip, 0, remote_is_ipv6); !opened.has_value()) {
-            return std::unexpected(opened.error());
+        if (!using_tcp()) {
+            const bool remote_is_ipv6 = remote.ip().find(':') != std::string::npos;
+            const std::string_view bind_ip = remote_is_ipv6 ? "::" : "0.0.0.0";
+            if (const auto opened = socket_.open(bind_ip, 0, remote_is_ipv6); !opened.has_value()) {
+                return std::unexpected(opened.error());
+            }
         }
         running_ = true;
         accepts_incoming_ = false;
@@ -704,9 +1070,48 @@ std::expected<PeerId, Error> Host::Impl::connect(const Address& remote) {
     peer.last_send = now;
     peer.last_connect_attempt = TimePoint{};
     peer.channels.resize(config_.channel_count);
+    if (using_tcp()) {
+        const sockaddr* native = detail::NativeAddressAccess::sockaddr_ref(remote);
+        detail::SocketHandle tcp_socket = ::socket(native->sa_family, SOCK_STREAM, IPPROTO_TCP);
+        if (tcp_socket == detail::kInvalidSocket) {
+            return std::unexpected(Error{
+                .code = ErrorCode::SocketOpenFailed,
+                .message = detail::socket_error_message(detail::last_socket_error())
+            });
+        }
+        if (const auto non_blocking = detail::set_non_blocking(tcp_socket); !non_blocking.has_value()) {
+            const Error error = non_blocking.error();
+            detail::close_socket(tcp_socket);
+            return std::unexpected(error);
+        }
+
+        const int connected = ::connect(
+            tcp_socket,
+            detail::NativeAddressAccess::sockaddr_ref(remote),
+            detail::NativeAddressAccess::length(remote));
+        if (connected != 0) {
+            const int err = detail::last_socket_error();
+            if (!is_connect_in_progress_error(err)) {
+                detail::close_socket(tcp_socket);
+                return std::unexpected(Error{
+                    .code = ErrorCode::SocketOpenFailed,
+                    .message = detail::socket_error_message(err)
+                });
+            }
+            peer.tcp_connect_in_progress = true;
+        }
+        peer.tcp_socket = tcp_socket;
+    }
+
     peers_[id] = std::move(peer);
 
-    (void)send_connect_request(*peers_[id]);
+    if (using_tcp()) {
+        if (!peers_[id]->tcp_connect_in_progress) {
+            (void)send_connect_request(*peers_[id]);
+        }
+    } else {
+        (void)send_connect_request(*peers_[id]);
+    }
     return id;
 }
 
@@ -934,7 +1339,35 @@ void Host::Impl::service() {
         }
         Peer& peer = *peers_[index];
 
-        if (peer.state == Peer::State::Connecting && peer.outgoing &&
+        if (using_tcp()) {
+            if (peer.tcp_socket == detail::kInvalidSocket) {
+                remove_peer(peer.id, DisconnectReason::RemoteClosed);
+                continue;
+            }
+
+            bool tcp_ready = true;
+            if (peer.tcp_connect_in_progress) {
+                auto connected = tcp_connect_finished(peer.tcp_socket);
+                if (!connected.has_value()) {
+                    remove_peer(peer.id, DisconnectReason::RemoteClosed);
+                    continue;
+                }
+                if (!*connected) {
+                    tcp_ready = false;
+                } else {
+                    peer.tcp_connect_in_progress = false;
+                }
+            }
+
+            if (tcp_ready) {
+                if (const auto flushed = flush_tcp_send(peer); !flushed.has_value()) {
+                    remove_peer(peer.id, DisconnectReason::RemoteClosed);
+                    continue;
+                }
+            }
+        }
+
+        if (peer.state == Peer::State::Connecting && peer.outgoing && !peer.tcp_connect_in_progress &&
             (now - peer.last_connect_attempt) >= config_.connect_retry_interval) {
             (void)send_connect_request(peer);
         }
@@ -992,6 +1425,21 @@ std::optional<PeerStats> Host::Impl::peer_stats(PeerId id) const {
     PeerStats stats = peers_[id]->stats;
     stats.connected_for = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - peers_[id]->created_at);
     return stats;
+}
+
+std::optional<Address> Host::Impl::upnp_external_address() const {
+    if (!upnp_mapping_.has_value() || upnp_mapping_->external_ip.empty()) {
+        return std::nullopt;
+    }
+    auto resolved = Address::from_ip(upnp_mapping_->external_ip, upnp_mapping_->external_port);
+    if (!resolved.has_value()) {
+        return std::nullopt;
+    }
+    return *resolved;
+}
+
+std::optional<Error> Host::Impl::upnp_last_error() const {
+    return upnp_last_error_;
 }
 
 PeerId Host::Impl::allocate_peer_id() const {
@@ -1072,16 +1520,44 @@ std::expected<void, Error> Host::Impl::send_packet(
         return std::unexpected(Error{ErrorCode::MessageTooLarge, "Datagram exceeds configured MTU"});
     }
 
-    auto sent = socket_.send_to(encoded, peer.address);
-    if (!sent.has_value()) {
-        return std::unexpected(sent.error());
+    std::size_t wire_bytes = 0;
+    if (using_tcp()) {
+        if (peer.tcp_socket == detail::kInvalidSocket) {
+            return std::unexpected(Error{
+                .code = ErrorCode::InvalidState,
+                .message = "TCP peer socket is not open"
+            });
+        }
+        if (encoded.size() > std::numeric_limits<std::uint16_t>::max()) {
+            return std::unexpected(Error{
+                .code = ErrorCode::MessageTooLarge,
+                .message = "TCP frame exceeds 16-bit length field"
+            });
+        }
+
+        const std::uint16_t frame_size = static_cast<std::uint16_t>(encoded.size());
+        peer.tcp_send_buffer.push_back(static_cast<std::byte>((frame_size >> 8) & 0xff));
+        peer.tcp_send_buffer.push_back(static_cast<std::byte>(frame_size & 0xff));
+        peer.tcp_send_buffer.insert(peer.tcp_send_buffer.end(), encoded.begin(), encoded.end());
+        wire_bytes = kTcpFrameHeaderSize + encoded.size();
+
+        auto flushed = flush_tcp_send(peer);
+        if (!flushed.has_value()) {
+            return std::unexpected(flushed.error());
+        }
+    } else {
+        auto sent = socket_.send_to(encoded, peer.address);
+        if (!sent.has_value()) {
+            return std::unexpected(sent.error());
+        }
+        wire_bytes = sent.value();
     }
 
     const TimePoint now = Clock::now();
     peer.last_send = now;
     peer.ack_dirty = false;
     peer.stats.packets_sent += 1;
-    peer.stats.bytes_sent += sent.value();
+    peer.stats.bytes_sent += wire_bytes;
     peer.sent_packets[header.packet_sequence] = SentPacket{now, reliable_ref};
     peer.sent_packet_order.push_back(header.packet_sequence);
     while (peer.sent_packet_order.size() > config_.max_sent_packet_history) {
@@ -1137,6 +1613,14 @@ std::expected<void, Error> Host::Impl::send_data_fragment(
 }
 
 void Host::Impl::receive_loop() {
+    if (using_tcp()) {
+        receive_loop_tcp();
+        return;
+    }
+    receive_loop_udp();
+}
+
+void Host::Impl::receive_loop_udp() {
     std::array<std::byte, kMaxUdpPacketSize> buffer{};
     while (true) {
         auto recv = socket_.receive(buffer);
@@ -1153,6 +1637,159 @@ void Host::Impl::receive_loop() {
         }
         std::span<const std::byte> bytes(buffer.data(), packet.size);
         process_datagram(packet.from, bytes);
+    }
+}
+
+std::expected<void, Error> Host::Impl::flush_tcp_send(Peer& peer) {
+    while (peer.tcp_send_offset < peer.tcp_send_buffer.size()) {
+        std::span<const std::byte> pending(
+            peer.tcp_send_buffer.data() + static_cast<std::ptrdiff_t>(peer.tcp_send_offset),
+            peer.tcp_send_buffer.size() - peer.tcp_send_offset);
+        auto sent = tcp_send_some(peer.tcp_socket, pending);
+        if (!sent.has_value()) {
+            return std::unexpected(sent.error());
+        }
+        if (!sent->has_value()) {
+            break;
+        }
+        peer.tcp_send_offset += **sent;
+    }
+
+    if (peer.tcp_send_offset == peer.tcp_send_buffer.size()) {
+        peer.tcp_send_buffer.clear();
+        peer.tcp_send_offset = 0;
+    } else if (peer.tcp_send_offset > 0 && peer.tcp_send_offset > peer.tcp_send_buffer.size() / 2) {
+        peer.tcp_send_buffer.erase(
+            peer.tcp_send_buffer.begin(),
+            peer.tcp_send_buffer.begin() + static_cast<std::ptrdiff_t>(peer.tcp_send_offset));
+        peer.tcp_send_offset = 0;
+    }
+
+    return {};
+}
+
+void Host::Impl::accept_tcp_peers() {
+    if (!accepts_incoming_ || tcp_listen_socket_ == detail::kInvalidSocket) {
+        return;
+    }
+
+    while (true) {
+        auto accepted = tcp_accept(tcp_listen_socket_);
+        if (!accepted.has_value()) {
+            break;
+        }
+        if (!accepted->has_value()) {
+            break;
+        }
+
+        auto [tcp_socket, from] = std::move(**accepted);
+        if (Peer* existing = peer_by_address(from); existing != nullptr) {
+            if (existing->tcp_socket != detail::kInvalidSocket) {
+                detail::close_socket(existing->tcp_socket);
+            }
+            existing->tcp_socket = tcp_socket;
+            existing->tcp_connect_in_progress = false;
+            continue;
+        }
+
+        const PeerId id = allocate_peer_id();
+        if (id == invalid_peer_id) {
+            detail::close_socket(tcp_socket);
+            continue;
+        }
+
+        const TimePoint now = Clock::now();
+        Peer peer{};
+        peer.id = id;
+        peer.wire_id = id;
+        peer.address = from;
+        peer.outgoing = false;
+        peer.state = Peer::State::Connected;
+        peer.created_at = now;
+        peer.last_recv = now;
+        peer.last_send = now;
+        peer.channels.resize(config_.channel_count);
+        peer.tcp_socket = tcp_socket;
+        peers_[id] = std::move(peer);
+
+        (void)send_connect_accept(*peers_[id]);
+
+        Event event{};
+        event.type = Event::Type::Connect;
+        event.connect.peer = id;
+        event.connect.address = from;
+        push_event(std::move(event));
+    }
+}
+
+void Host::Impl::receive_loop_tcp() {
+    accept_tcp_peers();
+
+    std::array<std::byte, 4096> recv_buffer{};
+    for (std::size_t index = 1; index < peers_.size(); ++index) {
+        if (!peers_[index].has_value()) {
+            continue;
+        }
+        PeerId id = peers_[index]->id;
+        if (peers_[index]->tcp_socket == detail::kInvalidSocket) {
+            remove_peer(id, DisconnectReason::RemoteClosed);
+            continue;
+        }
+
+        while (peers_[index].has_value()) {
+            Peer& peer = *peers_[index];
+            auto received = tcp_receive_some(peer.tcp_socket, recv_buffer);
+            if (!received.has_value()) {
+                remove_peer(peer.id, DisconnectReason::RemoteClosed);
+                break;
+            }
+            if (!received->has_value()) {
+                break;
+            }
+            if (**received == 0) {
+                remove_peer(peer.id, DisconnectReason::RemoteClosed);
+                break;
+            }
+
+            const std::size_t byte_count = **received;
+            peer.tcp_recv_buffer.insert(
+                peer.tcp_recv_buffer.end(),
+                recv_buffer.begin(),
+                recv_buffer.begin() + static_cast<std::ptrdiff_t>(byte_count));
+        }
+
+        if (!peers_[index].has_value()) {
+            continue;
+        }
+
+        while (peers_[index].has_value()) {
+            Peer& peer = *peers_[index];
+            if (peer.tcp_recv_buffer.size() < kTcpFrameHeaderSize) {
+                break;
+            }
+
+            std::span<const std::byte> frame_header(peer.tcp_recv_buffer.data(), peer.tcp_recv_buffer.size());
+            const std::uint16_t frame_size = read_u16(frame_header, 0);
+            if (frame_size == 0 || frame_size > config_.mtu) {
+                remove_peer(peer.id, DisconnectReason::ProtocolError);
+                break;
+            }
+            const std::size_t total_frame = kTcpFrameHeaderSize + static_cast<std::size_t>(frame_size);
+            if (peer.tcp_recv_buffer.size() < total_frame) {
+                break;
+            }
+
+            std::vector<std::byte> packet(frame_size);
+            std::memcpy(
+                packet.data(),
+                peer.tcp_recv_buffer.data() + static_cast<std::ptrdiff_t>(kTcpFrameHeaderSize),
+                frame_size);
+            peer.tcp_recv_buffer.erase(
+                peer.tcp_recv_buffer.begin(),
+                peer.tcp_recv_buffer.begin() + static_cast<std::ptrdiff_t>(total_frame));
+
+            process_datagram(peer.address, packet);
+        }
     }
 }
 
@@ -1910,6 +2547,11 @@ void Host::Impl::remove_peer(PeerId id, DisconnectReason reason) {
         return;
     }
 
+    if (peers_[id]->tcp_socket != detail::kInvalidSocket) {
+        detail::close_socket(peers_[id]->tcp_socket);
+        peers_[id]->tcp_socket = detail::kInvalidSocket;
+    }
+
     remove_peer_transfers(id);
 
     Event event{};
@@ -1986,6 +2628,14 @@ std::optional<Address> Host::peer_address(PeerId peer) const {
 
 std::optional<PeerStats> Host::peer_stats(PeerId peer) const {
     return impl_->peer_stats(peer);
+}
+
+std::optional<Address> Host::upnp_external_address() const {
+    return impl_->upnp_external_address();
+}
+
+std::optional<Error> Host::upnp_last_error() const {
+    return impl_->upnp_last_error();
 }
 
 std::vector<std::byte> to_bytes(std::string_view text) {
