@@ -1,0 +1,42 @@
+# CMake out-of-source builds
+/build/
+/build-*/
+
+# Optional in-source CMake artifacts
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/install_manifest.txt
+/CTestTestfile.cmake
+/Testing/
+/compile_commands.json
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/Makefile
+
+# Visual Studio / MSVC
+/.vs/
+*.suo
+*.user
+*.VC.db
+*.opendb
+*.lastbuildstate
+*.vcxproj.user
+
+# Compiled objects and binaries
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.pdb
+
+# Runtime / logs
+/downloads/
+*.log
