@@ -2,6 +2,7 @@
 
 #include "detail/address_native.hpp"
 #include "detail/platform.hpp"
+#include "detail/quic_transport.hpp"
 #include "detail/socket.hpp"
 #include "detail/upnp.hpp"
 
@@ -498,7 +499,11 @@ class Host::Impl {
 public:
     explicit Impl(HostConfig config)
         : config_(std::move(config)),
-          peers_(static_cast<std::size_t>(config_.max_peers) + 1) {}
+          peers_(static_cast<std::size_t>(config_.max_peers) + 1) {
+        if (config_.transport == Transport::Quic) {
+            quic_transport_ = std::make_unique<detail::QuicTransport>(config_);
+        }
+    }
 
     ~Impl() {
         clear_upnp_mapping();
@@ -649,6 +654,9 @@ public:
     [[nodiscard]] std::expected<void, Error> start_p2p(std::uint16_t port, std::string_view bind_ip);
     [[nodiscard]] std::expected<PeerId, Error> connect(const Address& remote);
     [[nodiscard]] std::expected<void, Error> send(PeerId id, std::span<const std::byte> bytes, SendOptions options);
+    [[nodiscard]] std::expected<StreamId, Error> open_stream(PeerId id, StreamOpenOptions options);
+    [[nodiscard]] std::expected<void, Error> send_stream(PeerId id, StreamId stream, std::span<const std::byte> bytes, StreamSendOptions options);
+    [[nodiscard]] std::expected<void, Error> close_stream(PeerId id, StreamId stream, std::uint64_t error_code);
     [[nodiscard]] std::expected<std::uint64_t, Error> send_file(PeerId peer, const std::filesystem::path& local_path, FileSendOptions options);
     [[nodiscard]] std::expected<void, Error> accept_file(PeerId peer, std::uint64_t transfer_id, const std::filesystem::path& destination_path);
     [[nodiscard]] std::expected<void, Error> reject_file(PeerId peer, std::uint64_t transfer_id, std::string_view reason);
@@ -668,6 +676,9 @@ public:
 private:
     [[nodiscard]] bool using_tcp() const noexcept {
         return config_.transport == Transport::Tcp;
+    }
+    [[nodiscard]] bool using_quic() const noexcept {
+        return config_.transport == Transport::Quic;
     }
 
     [[nodiscard]] PeerId allocate_peer_id() const;
@@ -737,6 +748,7 @@ private:
     bool socket_runtime_ready_{false};
     bool accepts_incoming_{false};
     Mode mode_{Mode::Stopped};
+    std::unique_ptr<detail::QuicTransport> quic_transport_{};
     detail::UdpSocket socket_{};
     detail::SocketHandle tcp_listen_socket_{detail::kInvalidSocket};
     std::vector<std::optional<Peer>> peers_{};
@@ -768,6 +780,12 @@ std::expected<void, Error> Host::Impl::validate_config() const {
         return std::unexpected(Error{
             .code = ErrorCode::InvalidState,
             .message = "HostConfig.transport must be UDP, TCP, or QUIC"
+        });
+    }
+    if (config_.transport == Transport::Quic && !detail::QuicTransport::available()) {
+        return std::unexpected(Error{
+            .code = ErrorCode::InvalidState,
+            .message = "This build does not include native QUIC support"
         });
     }
     if (config_.max_peers == 0) {
@@ -844,6 +862,16 @@ std::expected<void, Error> Host::Impl::validate_config() const {
 }
 
 std::expected<void, Error> Host::Impl::open_listen_socket(std::uint16_t port, std::string_view bind_ip) {
+    if (using_quic()) {
+        if (!quic_transport_) {
+            return std::unexpected(Error{
+                .code = ErrorCode::InvalidState,
+                .message = "QUIC transport is not available"
+            });
+        }
+        return quic_transport_->start_server(port, bind_ip);
+    }
+
     const bool explicit_ipv6 = bind_ip.find(':') != std::string_view::npos;
     const bool prefer_ipv6 = explicit_ipv6 || bind_ip == "::" || (bind_ip.empty() && config_.enable_ipv6);
     if (!using_tcp()) {
@@ -1040,6 +1068,39 @@ std::expected<PeerId, Error> Host::Impl::connect(const Address& remote) {
         return existing->id;
     }
 
+    if (using_quic()) {
+        if (!quic_transport_) {
+            return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+        }
+
+        auto connected = quic_transport_->connect(remote);
+        if (!connected.has_value()) {
+            return std::unexpected(connected.error());
+        }
+        const PeerId id = *connected;
+
+        const TimePoint now = Clock::now();
+        Peer peer{};
+        peer.id = id;
+        peer.address = remote;
+        peer.outgoing = true;
+        peer.state = Peer::State::Connecting;
+        peer.created_at = now;
+        peer.last_recv = now;
+        peer.last_send = now;
+        peer.channels.resize(config_.channel_count);
+        if (id < peers_.size()) {
+            peers_[id] = std::move(peer);
+        }
+
+        running_ = true;
+        if (mode_ == Mode::Stopped) {
+            accepts_incoming_ = false;
+            mode_ = Mode::Client;
+        }
+        return id;
+    }
+
     if (!running_) {
         if (const auto runtime = ensure_socket_runtime(); !runtime.has_value()) {
             return std::unexpected(runtime.error());
@@ -1127,6 +1188,12 @@ std::expected<void, Error> Host::Impl::send(PeerId id, std::span<const std::byte
     }
     if (options.channel >= config_.channel_count) {
         return std::unexpected(Error{ErrorCode::InvalidChannel, "Invalid channel id"});
+    }
+    if (using_quic()) {
+        if (!quic_transport_) {
+            return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+        }
+        return quic_transport_->send(id, bytes, options);
     }
     if (config_.mtu <= kWireHeaderSize) {
         return std::unexpected(Error{ErrorCode::InvalidState, "MTU is too small"});
@@ -1231,6 +1298,63 @@ std::expected<void, Error> Host::Impl::send(PeerId id, std::span<const std::byte
     return {};
 }
 
+std::expected<StreamId, Error> Host::Impl::open_stream(PeerId id, StreamOpenOptions options) {
+    Peer* peer = peer_by_id(id);
+    if (peer == nullptr) {
+        return std::unexpected(Error{ErrorCode::InvalidPeer, "Unknown peer id"});
+    }
+    if (peer->state != Peer::State::Connected) {
+        return std::unexpected(Error{ErrorCode::InvalidState, "Peer is not connected"});
+    }
+    if (!using_quic()) {
+        return std::unexpected(Error{
+            .code = ErrorCode::InvalidState,
+            .message = "Streams are only available with Transport::Quic"
+        });
+    }
+    if (!quic_transport_) {
+        return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+    }
+    return quic_transport_->open_stream(id, options);
+}
+
+std::expected<void, Error> Host::Impl::send_stream(PeerId id, StreamId stream, std::span<const std::byte> bytes, StreamSendOptions options) {
+    Peer* peer = peer_by_id(id);
+    if (peer == nullptr) {
+        return std::unexpected(Error{ErrorCode::InvalidPeer, "Unknown peer id"});
+    }
+    if (peer->state != Peer::State::Connected) {
+        return std::unexpected(Error{ErrorCode::InvalidState, "Peer is not connected"});
+    }
+    if (!using_quic()) {
+        return std::unexpected(Error{
+            .code = ErrorCode::InvalidState,
+            .message = "Streams are only available with Transport::Quic"
+        });
+    }
+    if (!quic_transport_) {
+        return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+    }
+    return quic_transport_->send_stream(id, stream, bytes, options);
+}
+
+std::expected<void, Error> Host::Impl::close_stream(PeerId id, StreamId stream, std::uint64_t error_code) {
+    Peer* peer = peer_by_id(id);
+    if (peer == nullptr) {
+        return std::unexpected(Error{ErrorCode::InvalidPeer, "Unknown peer id"});
+    }
+    if (!using_quic()) {
+        return std::unexpected(Error{
+            .code = ErrorCode::InvalidState,
+            .message = "Streams are only available with Transport::Quic"
+        });
+    }
+    if (!quic_transport_) {
+        return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+    }
+    return quic_transport_->close_stream(id, stream, error_code);
+}
+
 std::expected<std::uint64_t, Error> Host::Impl::send_file(PeerId peer_id, const std::filesystem::path& local_path, FileSendOptions options) {
     Peer* peer = peer_by_id(peer_id);
     if (peer == nullptr) {
@@ -1317,6 +1441,13 @@ std::expected<void, Error> Host::Impl::disconnect(PeerId id, DisconnectReason re
         return std::unexpected(Error{ErrorCode::InvalidPeer, "Unknown peer id"});
     }
 
+    if (using_quic()) {
+        if (!quic_transport_) {
+            return std::unexpected(Error{ErrorCode::InvalidState, "QUIC transport is not available"});
+        }
+        return quic_transport_->disconnect(id, reason);
+    }
+
     std::array<std::byte, 2> payload{};
     const std::uint16_t wire = static_cast<std::uint16_t>(reason);
     payload[0] = static_cast<std::byte>((wire >> 8) & 0xff);
@@ -1329,6 +1460,70 @@ std::expected<void, Error> Host::Impl::disconnect(PeerId id, DisconnectReason re
 
 void Host::Impl::service() {
     if (!running_) {
+        return;
+    }
+
+    if (using_quic()) {
+        if (!quic_transport_) {
+            return;
+        }
+
+        quic_transport_->service();
+        while (auto event = quic_transport_->poll_event()) {
+            switch (event->type) {
+            case Event::Type::Connect: {
+                if (event->connect.peer < peers_.size()) {
+                    const TimePoint now = Clock::now();
+                    if (!peers_[event->connect.peer].has_value()) {
+                        Peer peer{};
+                        peer.id = event->connect.peer;
+                        peer.address = event->connect.address;
+                        peer.outgoing = false;
+                        peer.state = Peer::State::Connected;
+                        peer.created_at = now;
+                        peer.last_recv = now;
+                        peer.last_send = now;
+                        peer.channels.resize(config_.channel_count);
+                        peers_[event->connect.peer] = std::move(peer);
+                    } else {
+                        peers_[event->connect.peer]->address = event->connect.address;
+                        peers_[event->connect.peer]->state = Peer::State::Connected;
+                        peers_[event->connect.peer]->last_recv = now;
+                        peers_[event->connect.peer]->last_send = now;
+                    }
+                }
+                push_event(std::move(*event));
+                break;
+            }
+            case Event::Type::Disconnect:
+                if (event->disconnect.peer < peers_.size()) {
+                    remove_peer_transfers(event->disconnect.peer);
+                    peers_[event->disconnect.peer].reset();
+                }
+                push_event(std::move(*event));
+                break;
+            case Event::Type::Message: {
+                if (event->message.peer < peers_.size() && peers_[event->message.peer].has_value()) {
+                    if (handle_file_control(*peers_[event->message.peer], event->message.payload)) {
+                        break;
+                    }
+                }
+                push_event(std::move(*event));
+                break;
+            }
+            case Event::Type::StreamOpen:
+            case Event::Type::StreamData:
+            case Event::Type::StreamClose:
+            case Event::Type::FileOffer:
+            case Event::Type::FileProgress:
+            case Event::Type::FileComplete:
+            case Event::Type::FileRejected:
+                push_event(std::move(*event));
+                break;
+            }
+        }
+
+        pump_uploads();
         return;
     }
 
@@ -1404,6 +1599,9 @@ std::optional<Event> Host::Impl::poll_event() {
 }
 
 std::vector<PeerId> Host::Impl::connected_peers() const {
+    if (using_quic() && quic_transport_) {
+        return quic_transport_->connected_peers();
+    }
     std::vector<PeerId> out;
     for (std::size_t index = 1; index < peers_.size(); ++index) {
         if (peers_[index].has_value() && peers_[index]->state == Peer::State::Connected) {
@@ -1414,6 +1612,9 @@ std::vector<PeerId> Host::Impl::connected_peers() const {
 }
 
 std::optional<Address> Host::Impl::peer_address(PeerId id) const {
+    if (using_quic() && quic_transport_) {
+        return quic_transport_->peer_address(id);
+    }
     if (id == invalid_peer_id || id >= peers_.size() || !peers_[id].has_value()) {
         return std::nullopt;
     }
@@ -1421,6 +1622,9 @@ std::optional<Address> Host::Impl::peer_address(PeerId id) const {
 }
 
 std::optional<PeerStats> Host::Impl::peer_stats(PeerId id) const {
+    if (using_quic() && quic_transport_) {
+        return quic_transport_->peer_stats(id);
+    }
     if (id == invalid_peer_id || id >= peers_.size() || !peers_[id].has_value()) {
         return std::nullopt;
     }
@@ -2586,6 +2790,18 @@ std::expected<PeerId, Error> Host::connect(const Address& remote) {
 
 std::expected<void, Error> Host::send(PeerId peer, std::span<const std::byte> bytes, SendOptions options) {
     return impl_->send(peer, bytes, options);
+}
+
+std::expected<StreamId, Error> Host::open_stream(PeerId peer, StreamOpenOptions options) {
+    return impl_->open_stream(peer, options);
+}
+
+std::expected<void, Error> Host::send_stream(PeerId peer, StreamId stream, std::span<const std::byte> bytes, StreamSendOptions options) {
+    return impl_->send_stream(peer, stream, bytes, options);
+}
+
+std::expected<void, Error> Host::close_stream(PeerId peer, StreamId stream, std::uint64_t error_code) {
+    return impl_->close_stream(peer, stream, error_code);
 }
 
 std::expected<std::uint64_t, Error> Host::send_file(PeerId peer, const std::filesystem::path& local_path, FileSendOptions options) {

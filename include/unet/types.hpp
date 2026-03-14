@@ -8,6 +8,8 @@ namespace unet {
 
 using PeerId = std::uint16_t;
 inline constexpr PeerId invalid_peer_id = 0;
+using StreamId = std::uint64_t;
+inline constexpr StreamId invalid_stream_id = 0;
 
 enum class Transport : std::uint8_t {
     Udp = 0,

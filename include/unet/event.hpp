@@ -27,6 +27,28 @@ struct MessageEvent {
     std::vector<std::byte> payload{};
 };
 
+struct StreamOpenEvent {
+    PeerId peer{invalid_peer_id};
+    StreamId stream{invalid_stream_id};
+    std::uint8_t channel{};
+    bool bidirectional{true};
+    bool remote_initiated{};
+};
+
+struct StreamDataEvent {
+    PeerId peer{invalid_peer_id};
+    StreamId stream{invalid_stream_id};
+    std::vector<std::byte> payload{};
+    bool fin{};
+};
+
+struct StreamCloseEvent {
+    PeerId peer{invalid_peer_id};
+    StreamId stream{invalid_stream_id};
+    std::uint64_t error_code{};
+    bool remote{};
+};
+
 struct FileOfferEvent {
     PeerId peer{invalid_peer_id};
     std::uint64_t transfer_id{};
@@ -63,6 +85,9 @@ struct Event {
         Connect,
         Disconnect,
         Message,
+        StreamOpen,
+        StreamData,
+        StreamClose,
         FileOffer,
         FileProgress,
         FileComplete,
@@ -73,6 +98,9 @@ struct Event {
     ConnectEvent connect{};
     DisconnectEvent disconnect{};
     MessageEvent message{};
+    StreamOpenEvent stream_open{};
+    StreamDataEvent stream_data{};
+    StreamCloseEvent stream_close{};
     FileOfferEvent file_offer{};
     FileProgressEvent file_progress{};
     FileCompleteEvent file_complete{};

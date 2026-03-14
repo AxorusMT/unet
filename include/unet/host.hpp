@@ -49,10 +49,29 @@ struct HostConfig {
     std::string upnp_description{"unet"};
     std::string upnp_discovery_address{"239.255.255.250"};
     std::uint16_t upnp_discovery_port{1900};
+    std::string quic_alpn{"unet"};
+    bool quic_insecure_skip_verify{true};
+    std::string quic_certificate_thumbprint{};
+    std::string quic_certificate_store_name{"MY"};
+    bool quic_certificate_store_machine{false};
+    std::string quic_certificate_file{};
+    std::string quic_private_key_file{};
+    std::string quic_private_key_password{};
+    std::string quic_pkcs12_file{};
+    std::string quic_pkcs12_password{};
 };
 
 struct FileSendOptions {
     std::string remote_name{};
+};
+
+struct StreamOpenOptions {
+    std::uint8_t channel{0};
+    bool bidirectional{true};
+};
+
+struct StreamSendOptions {
+    bool fin{false};
 };
 
 class Host final {
@@ -69,6 +88,9 @@ public:
     [[nodiscard]] std::expected<void, Error> start_p2p(std::uint16_t port, std::string_view bind_ip = "::");
     [[nodiscard]] std::expected<PeerId, Error> connect(const Address& remote);
     [[nodiscard]] std::expected<void, Error> send(PeerId peer, std::span<const std::byte> bytes, SendOptions options = {});
+    [[nodiscard]] std::expected<StreamId, Error> open_stream(PeerId peer, StreamOpenOptions options = {});
+    [[nodiscard]] std::expected<void, Error> send_stream(PeerId peer, StreamId stream, std::span<const std::byte> bytes, StreamSendOptions options = {});
+    [[nodiscard]] std::expected<void, Error> close_stream(PeerId peer, StreamId stream, std::uint64_t error_code = 0);
     [[nodiscard]] std::expected<std::uint64_t, Error> send_file(PeerId peer, const std::filesystem::path& local_path, FileSendOptions options = {});
     [[nodiscard]] std::expected<void, Error> accept_file(PeerId peer, std::uint64_t transfer_id, const std::filesystem::path& destination_path);
     [[nodiscard]] std::expected<void, Error> reject_file(PeerId peer, std::uint64_t transfer_id, std::string_view reason = "rejected");

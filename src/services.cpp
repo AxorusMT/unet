@@ -495,6 +495,9 @@ void DirectoryServer::Impl::service() {
         case Event::Type::FileProgress:
         case Event::Type::FileComplete:
         case Event::Type::FileRejected:
+        case Event::Type::StreamOpen:
+        case Event::Type::StreamData:
+        case Event::Type::StreamClose:
             break;
         }
     }

@@ -7,12 +7,13 @@ It provides:
 - P2P node mode (listen + dial on the same host)
 - Reliable ordered delivery with retransmission/ordering
 - Unreliable and unreliable-sequenced delivery modes
-- Channel-based streams
+- QUIC stream API (`open_stream`, `send_stream`, `close_stream`) with stream events
 - Automatic MTU-aware fragmentation + reassembly
 - Packet-level ack bitfield (`ack` + `ack_bits`) with RTT estimation
 - Handshake (`ConnectRequest` / `ConnectAccept`)
 - Heartbeats (`Ping` / `Pong`) and timeout disconnects
-- Event-driven API (`Connect`, `Disconnect`, `Message`)
+- Event-driven API (`Connect`, `Disconnect`, `Message`, `StreamOpen`, `StreamData`, `StreamClose`)
+- HTTP/3-style request/response API over QUIC streams (`Http3Server`, `Http3Client`)
 - Built-in file upload/download protocol with offer/accept/reject/progress/complete events
 - Directory/master services:
   - Server browser registration + listing
@@ -29,6 +30,10 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build -C Debug --output-on-failure
 ```
+
+Native QUIC is enabled by default on Windows and MsQuic is fetched via CMake `FetchContent` from `Microsoft.Native.Quic.MsQuic.Schannel`.
+
+- Disable native QUIC: `-DUNET_ENABLE_NATIVE_QUIC=OFF`
 
 ## Quick start
 
@@ -71,9 +76,67 @@ unet::Host server(cfg);
 server.start_server(7777, "0.0.0.0");
 ```
 
-`Transport::Quic` currently uses the datagram transport path (UDP socket + unet packet protocol). It does not yet implement TLS, HTTP/3, or QUIC stream primitives.
+For `Transport::Quic`, configure TLS credentials on the server side:
+
+- Windows certificate store thumbprint (recommended with Schannel package):
+  - `quic_certificate_thumbprint`
+  - `quic_certificate_store_name` (default `"MY"`)
+  - `quic_certificate_store_machine`
+- Or portable certs:
+  - `quic_pkcs12_file` + `quic_pkcs12_password`
+  - `quic_certificate_file` + `quic_private_key_file`
+
+Client cert validation behavior is controlled by `quic_insecure_skip_verify` (default `true` for local/dev flows).
+
+`quic_alpn` controls ALPN for QUIC and HTTP3 endpoints.
 
 `DirectoryServer` / `DirectoryClient` use `DirectoryConfig::host.transport`.
+
+## QUIC Streams
+
+```cpp
+unet::StreamOpenOptions open{};
+open.channel = 1;
+open.bidirectional = true;
+
+auto stream = host.open_stream(peer, open);
+
+unet::StreamSendOptions send{};
+send.fin = true;
+host.send_stream(peer, *stream, unet::to_bytes("stream payload"), send);
+```
+
+Stream events:
+
+- `Event::Type::StreamOpen`
+- `Event::Type::StreamData`
+- `Event::Type::StreamClose`
+
+## HTTP3 API
+
+```cpp
+unet::Http3Config cfg{};
+cfg.host.transport = unet::Transport::Quic;
+
+unet::Http3Server server(cfg);
+server.set_handler([](const unet::Http3Request& req) {
+    unet::Http3Response res{};
+    res.status = 200;
+    res.body = req.body;
+    return res;
+});
+server.start(8443, "127.0.0.1");
+
+unet::Http3Client client(cfg);
+auto addr = unet::Address::resolve("127.0.0.1", 8443, false);
+client.connect(*addr);
+
+unet::Http3Request req{};
+req.method = "POST";
+req.path = "/echo";
+req.body = unet::to_bytes("hello");
+auto response = client.request(req);
+```
 
 ## P2P + files
 
@@ -178,3 +241,14 @@ Client APIs:
 - `unet_tcp_chat_server`
 - `unet_tcp_chat_client`
 - `unet_upnp_server`
+
+## QUIC/HTTP3 Tests
+
+`unet_quic_test` and `unet_http3_test` are integration tests that are intentionally gated behind an env var:
+
+```bash
+set UNET_ENABLE_NATIVE_QUIC_TESTS=1
+ctest --test-dir build -C Debug -R "unet_quic_test|unet_http3_test" --output-on-failure
+```
+
+Without the env var, those tests return `skipped` so default `ctest` runs stay deterministic across environments.
