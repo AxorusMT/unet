@@ -762,10 +762,12 @@ std::expected<void, Error> Host::Impl::ensure_socket_runtime() {
 }
 
 std::expected<void, Error> Host::Impl::validate_config() const {
-    if (config_.transport != Transport::Udp && config_.transport != Transport::Tcp) {
+    if (config_.transport != Transport::Udp &&
+        config_.transport != Transport::Tcp &&
+        config_.transport != Transport::Quic) {
         return std::unexpected(Error{
             .code = ErrorCode::InvalidState,
-            .message = "HostConfig.transport must be UDP or TCP"
+            .message = "HostConfig.transport must be UDP, TCP, or QUIC"
         });
     }
     if (config_.max_peers == 0) {

@@ -106,6 +106,14 @@ if(UNET_BUILD_TESTS)
             ENVIRONMENT "PATH=${UNET_MSVC_ASAN_RUNTIME_DIR};$ENV{PATH}")
     endif()
 
+    add_executable(unet_quic_test tests/quic_test.cpp)
+    target_link_libraries(unet_quic_test PRIVATE unet)
+    add_test(NAME unet_quic_test COMMAND unet_quic_test)
+    if(UNET_ENABLE_SANITIZERS AND MSVC)
+        set_tests_properties(unet_quic_test PROPERTIES
+            ENVIRONMENT "PATH=${UNET_MSVC_ASAN_RUNTIME_DIR};$ENV{PATH}")
+    endif()
+
     add_executable(unet_upnp_test tests/upnp_test.cpp)
     target_link_libraries(unet_upnp_test PRIVATE unet)
     add_test(NAME unet_upnp_test COMMAND unet_upnp_test)

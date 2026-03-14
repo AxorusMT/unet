@@ -1,9 +1,9 @@
 # unet
-`unet` is a modern C++23 game networking library inspired by ENet, with UDP and TCP transport support.
+`unet` is a modern C++23 game networking library inspired by ENet, with UDP, TCP, and QUIC transport modes.
 
 It provides:
 
-- Connection-oriented host/peer model over UDP or TCP
+- Connection-oriented host/peer model over UDP, TCP, or QUIC
 - P2P node mode (listen + dial on the same host)
 - Reliable ordered delivery with retransmission/ordering
 - Unreliable and unreliable-sequenced delivery modes
@@ -19,7 +19,7 @@ It provides:
   - Server comments with threaded replies + likes
   - Matchmaking from player profile data (region/playlist/mmr/party size)
   - NAT traversal coordination (UDP hole-punch rendezvous)
-- Optional UPnP IGD port mapping for incoming UDP/TCP endpoints
+- Optional UPnP IGD port mapping for incoming UDP/TCP/QUIC endpoints
 - Native platform sockets (WinSock2 / POSIX sockets), no external deps
 
 ## Build
@@ -65,11 +65,13 @@ for (;;) {
 
 ```cpp
 unet::HostConfig cfg{};
-cfg.transport = unet::Transport::Tcp; // default is Transport::Udp
+cfg.transport = unet::Transport::Quic; // default is Transport::Udp
 
 unet::Host server(cfg);
 server.start_server(7777, "0.0.0.0");
 ```
+
+`Transport::Quic` currently uses the datagram transport path (UDP socket + unet packet protocol). It does not yet implement TLS, HTTP/3, or QUIC stream primitives.
 
 `DirectoryServer` / `DirectoryClient` use `DirectoryConfig::host.transport`.
 

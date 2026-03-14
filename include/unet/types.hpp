@@ -11,7 +11,8 @@ inline constexpr PeerId invalid_peer_id = 0;
 
 enum class Transport : std::uint8_t {
     Udp = 0,
-    Tcp = 1
+    Tcp = 1,
+    Quic = 2
 };
 
 enum class Delivery : std::uint8_t {
